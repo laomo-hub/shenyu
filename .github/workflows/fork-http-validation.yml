@@ -1,0 +1,176 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Fork HTTP integration validation
+
+on:
+  push:
+    branches:
+      - codex/7785-http-ci
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-http-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  http:
+    if: github.repository == 'laomo-hub/shenyu'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        case: [shenyu-integrated-test-http]
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: true
+          fetch-depth: 0
+      - name: Verify source matches PR commit
+        run: |
+          git log -1 --format='%H %s'
+          git diff --exit-code 78d2d4dc9fed810e2072815a17c73086a99a2f80 HEAD -- . ':(exclude).github/workflows/fork-http-validation.yml'
+      # Copied from https://github.com/jens-maus/RaspberryMatic/blob/ea6b8ce0dd2d53ea88b2766ba8d7f8e1d667281f/.github/workflows/ci.yml#L34-L40
+      # and https://github.com/actions/virtual-environments/issues/709#issuecomment-612569242
+      - name: Free disk space
+        run: |
+          df --human-readable
+          sudo apt clean
+          for image in $(docker image ls --all --quiet); do
+            docker rmi $image
+          done
+          rm --recursive --force "$AGENT_TOOLSDIRECTORY"
+          df --human-readable
+      - uses: ./actions/setup-java-with-retry
+        with:
+          java-version: 17
+          distribution: "temurin"
+          cache: "maven"
+          cache-dependency-path: |
+            **/pom.xml
+      - name: Pre-pull docker base images
+        shell: bash
+        run: |
+          pull_with_retry() {
+            local image="$1"
+            for attempt in 1 2 3; do
+              if docker pull "$image"; then
+                return 0
+              fi
+              echo "docker pull $image failed on attempt $attempt"
+              sleep $((attempt * 10))
+            done
+            docker pull "$image"
+          }
+
+          pull_with_retry alpine:latest
+          pull_with_retry amazoncorretto:17.0.11-alpine3.19
+          pull_with_retry centos:7
+          pull_with_retry eclipse-temurin:17-centos7
+          pull_with_retry elasticsearch:8.2.3
+      - name: Build with Maven
+        shell: bash
+        run: ./mvnw -B -T 1C clean install -Prelease,docker -Dmaven.javadoc.skip=true -Dmaven.test.skip=true
+      - name: Build examples
+        shell: bash
+        run: ./mvnw -B -T 1C clean install -Pexample -Dmaven.javadoc.skip=true -Dmaven.test.skip=true -am -f ./shenyu-examples/pom.xml
+      - name: Build integrated tests
+        shell: bash
+        # mvnd can report success while skipping this entire subreactor.
+        run: |
+          ./mvnw -B -ntp -T 1C clean install -Pit -Dmaven.test.skip=true \
+            -pl :${{ matrix.case }} -am -f ./shenyu-integrated-test/pom.xml
+      - name: Verify integrated test image
+        run: docker image inspect apache/${{ matrix.case }}:latest --format '{{.Id}}'
+      - name: Start docker compose
+        run: docker compose -f ./shenyu-integrated-test/${{ matrix.case }}/docker-compose.yml up -d
+      - name: Wait for docker compose start up completely
+        run: bash ./shenyu-integrated-test/${{ matrix.case }}/script/healthcheck.sh
+      - name: Disk space info
+        run: |
+          df --human-readable
+      - name: Run test
+        id: test
+        shell: bash
+        run: |
+          ./mvnw -B -ntp -T 1C test -Pit -DfailIfNoTests=true \
+            -f ./shenyu-integrated-test/${{ matrix.case }}/pom.xml
+        continue-on-error: true
+      - name: Check test result
+        run: |
+          docker compose -f ./shenyu-integrated-test/${{ matrix.case }}/docker-compose.yml logs --tail="all"
+          if [[ ${{steps.test.outcome}} == "failure" ]]; then
+            echo "Test Failed"
+            exit 1
+          else
+            echo "Test Successful"
+            exit 0
+          fi
+
+      - name: Summarize HTTP test reports
+        if: always() && (steps.test.outcome == 'success' || steps.test.outcome == 'failure')
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          report_dir = Path("shenyu-integrated-test/shenyu-integrated-test-http/target/surefire-reports")
+          totals = dict(tests=0, failures=0, errors=0, skipped=0)
+          target_cases = []
+          reports = list(report_dir.glob("TEST-*.xml"))
+          for report in reports:
+              suite = ET.parse(report).getroot()
+              for key in totals:
+                  totals[key] += int(suite.get(key, 0))
+              for case in suite.iter("testcase"):
+                  if case.get("classname", "").endswith("SignPluginVersionTwoTest") and case.get("name") == "testSignWithNotConfiguredPath":
+                      target_cases.append(dict(
+                          name=case.get("name"),
+                          time=case.get("time"),
+                          passed=not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")),
+                      ))
+          summary = dict(source_commit="78d2d4dc9fed810e2072815a17c73086a99a2f80",
+                         reports=len(reports), totals=totals, previous_timeout_case=target_cases)
+          Path("http-validation-summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+          print(json.dumps(summary, indent=2))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write("## HTTP integration results\n\n" + json.dumps(summary, indent=2) + "\n")
+          if not reports or not totals["tests"] or not target_cases:
+              raise SystemExit("Expected HTTP suite and previous timeout case were not executed")
+          if totals["failures"] or totals["errors"] or not all(case["passed"] for case in target_cases):
+              raise SystemExit("HTTP integration tests did not pass")
+          PY
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          mkdir -p http-validation-evidence
+          docker compose -f shenyu-integrated-test/shenyu-integrated-test-http/docker-compose.yml ps -a > http-validation-evidence/compose-ps.txt 2>&1 || true
+          docker compose -f shenyu-integrated-test/shenyu-integrated-test-http/docker-compose.yml logs --no-color > http-validation-evidence/compose.log 2>&1 || true
+          cp -a shenyu-integrated-test/shenyu-integrated-test-http/target/surefire-reports http-validation-evidence/ 2>/dev/null || true
+          cp http-validation-summary.json http-validation-evidence/ 2>/dev/null || true
+      - name: Upload HTTP test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: http-validation-evidence
+          path: http-validation-evidence
+          retention-days: 14
+      - name: Stop test containers
+        if: always()
+        run: docker compose -f shenyu-integrated-test/shenyu-integrated-test-http/docker-compose.yml down --volumes --remove-orphans
